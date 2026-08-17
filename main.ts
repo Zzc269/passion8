@@ -1,10 +1,17 @@
 /**
  * passion8 relay - Claude 1h full-prefix cache + current-time injection + response diagnostics
- * Single-file version for Zeabur (v2: force non-stream + SSE conversion)
+ * Single-file version for Zeabur (v3: HTTPS/method hardening + canonical upstream paths)
  * Upstream: https://passion8.cc
  *
  * LobeHub Anthropic Base URL:
  * https://YOUR_PROJECT.zeabur.app
+ * Do not use http:// and do not append /v1/messages to the Base URL.
+ *
+ * v3 changes:
+ * - Redirects HTTP to HTTPS with status 308 so POST and its body are preserved.
+ * - Rejects GET /v1/messages and GET /v1/chat/completions locally with a clear 405.
+ * - Canonicalizes /messages and /chat/completions aliases to their /v1 upstream paths.
+ * - Keeps all v2 non-stream/SSE, cache, time injection and diagnostics behavior.
  *
  * v2 changes (fix: upstream streaming path rejecting message-level ttl:"1h"):
  * - FORCE_NON_STREAM=1 (default on): rewrites incoming stream=true requests to
@@ -30,10 +37,12 @@
  * TIME_ZONE           default Asia/Shanghai
  * DEBUG               "1" = print detailed logs for successful requests too
  * FORCE_NON_STREAM    "0" = passthrough streaming (may hit upstream 502); default force non-stream + SSE
+ * FORCE_HTTPS          "0" = disable production HTTP->HTTPS 308 redirect; default on
  * PORT                listen port; default 8000 (Zeabur injects PORT for some service types)
  */
 
 const PROVIDER = "passion8";
+const VERSION = "v3";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -52,6 +61,7 @@ const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
+const FORCE_HTTPS = Deno.env.get("FORCE_HTTPS") !== "0";
 const PORT = Number(Deno.env.get("PORT") || 8000);
 
 const parsedTail = Number(Deno.env.get("TAIL_BREAKPOINTS") ?? "2");
@@ -130,8 +140,19 @@ function isChatPath(path: string): boolean {
   return path === "/v1/chat/completions" || path === "/chat/completions";
 }
 
+function canonicalUpstreamPath(path: string): string {
+  if (isMessagesPath(path)) return "/v1/messages";
+  if (isChatPath(path)) return "/v1/chat/completions";
+  return path;
+}
+
+function isLocalHostname(hostname: string): boolean {
+  const value = hostname.toLowerCase();
+  return value === "localhost" || value === "127.0.0.1" || value === "::1";
+}
+
 function resolveUpstream(path: string): string {
-  return UPSTREAM + path;
+  return UPSTREAM + canonicalUpstreamPath(path);
 }
 
 function formatTime(date = new Date(), includeSeconds = false): string {
@@ -747,10 +768,26 @@ async function handler(req: Request): Promise<Response> {
   // Allow viewing diagnostics via ?proxy_token=... in browser, never forward it upstream.
   url.searchParams.delete("proxy_token");
 
+  // Use 308 rather than 301/302/303 so POST /v1/messages and its request body
+  // remain POST when the client follows the HTTP -> HTTPS redirect.
+  const forwardedProto = (req.headers.get("x-forwarded-proto") || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  const arrivedOverHttp = forwardedProto === "http" || url.protocol === "http:";
+  if (FORCE_HTTPS && arrivedOverHttp && !isLocalHostname(url.hostname)) {
+    url.protocol = "https:";
+    const headers = new Headers(CORS_HEADERS);
+    headers.set("location", url.toString());
+    headers.set("cache-control", "no-store");
+    return new Response(null, { status: 308, headers });
+  }
+
   if (req.method === "GET" && (path === "/" || path === "/health")) {
     return json({
       ok: true,
       provider: PROVIDER,
+      version: VERSION,
       upstream: UPSTREAM,
       cache: CACHE_ENABLED ? `${TTL}/${BREAKPOINT_MODE}` : "passthrough",
       beta: CACHE_ENABLED ? BETA_FLAG : "not-added",
@@ -758,6 +795,7 @@ async function handler(req: Request): Promise<Response> {
       currentTimeInjection: TIME_ENABLED,
       timeZone: TIME_ZONE,
       forceNonStream: FORCE_NON_STREAM,
+      forceHttps: FORCE_HTTPS,
       upstreamAttemptsPerIncomingRequest: 1,
       logsInThisInstance: LOG_LINES.length,
     });
@@ -775,6 +813,26 @@ async function handler(req: Request): Promise<Response> {
     return new Response("Logs cleared.", {
       headers: { ...CORS_HEADERS, "content-type": "text/plain; charset=utf-8" },
     });
+  }
+
+  // Anthropic Messages and OpenAI Chat Completions are POST-only. Do not
+  // passthrough an accidental GET to the upstream, where it becomes the vague
+  // "Invalid URL (GET /v1/messages)" error.
+  if ((isMessagesPath(path) || isChatPath(path)) && req.method !== "POST") {
+    const headers = new Headers({
+      ...CORS_HEADERS,
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "allow": "POST, OPTIONS",
+    });
+    return new Response(JSON.stringify({
+      error: {
+        message: `Method not allowed (${req.method} ${path}). Use an https:// Base URL; this endpoint requires POST.`,
+        type: "invalid_request_error",
+        param: "",
+        code: "method_not_allowed",
+      },
+    }), { status: 405, headers });
   }
 
   const id = `${++sequence}-${crypto.randomUUID().slice(0, 8)}`;
