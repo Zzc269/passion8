@@ -1,11 +1,14 @@
 /**
  * passion8 relay - Claude 1h full-prefix cache + current-time injection + response diagnostics
- * Single-file version for Zeabur (v3: HTTPS/method hardening + canonical upstream paths)
+ * Single-file version for Zeabur (v3.1: reverse-proxy-safe HTTPS detection)
  * Upstream: https://passion8.cc
  *
  * LobeHub Anthropic Base URL:
  * https://YOUR_PROJECT.zeabur.app
  * Do not use http:// and do not append /v1/messages to the Base URL.
+ *
+ * v3.1 fix:
+ * - Trusts x-forwarded-proto when present, avoiding an HTTPS redirect loop behind Zeabur.
  *
  * v3 changes:
  * - Redirects HTTP to HTTPS with status 308 so POST and its body are preserved.
@@ -42,7 +45,7 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3";
+const VERSION = "v3.1";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -774,7 +777,11 @@ async function handler(req: Request): Promise<Response> {
     .split(",")[0]
     .trim()
     .toLowerCase();
-  const arrivedOverHttp = forwardedProto === "http" || url.protocol === "http:";
+  // Behind Zeabur, req.url may use the internal http: hop even when the public
+  // request was HTTPS. If x-forwarded-proto exists, it is authoritative.
+  const arrivedOverHttp = forwardedProto
+    ? forwardedProto === "http"
+    : url.protocol === "http:";
   if (FORCE_HTTPS && arrivedOverHttp && !isLocalHostname(url.hostname)) {
     url.protocol = "https:";
     const headers = new Headers(CORS_HEADERS);
