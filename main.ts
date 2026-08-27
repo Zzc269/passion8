@@ -45,7 +45,7 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3.1";
+const VERSION = "v3.2-probe";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -575,6 +575,20 @@ function readUsage(text: string, key: string): string {
   return value;
 }
 
+/** 验水指纹：从上游响应体提取思考/签名/空完成证据。 */
+function probeResponse(text: string): string {
+  const hasThinking = text.includes('"type":"thinking"') || text.includes('"type": "thinking"') || text.includes('"reasoning"');
+  const hasSignature = text.includes('"signature"');
+  const thinkTok = readUsage(text, "thinking_tokens") !== "-"
+    ? readUsage(text, "thinking_tokens")
+    : readUsage(text, "reasoning_tokens");
+  const hasEmpty = text.includes('"content":[]') && text.includes('"stop_reason":"end_turn"');
+  const parts = [`think=${hasThinking ? "Y" : "N"}`, `sig=${hasSignature ? "Y" : "N"}`];
+  if (thinkTok !== "-") parts.push(`thinkTok=${thinkTok}`);
+  if (hasEmpty) parts.push(`EMPTY=YES`);
+  return parts.join(" ");
+}
+
 interface ForwardMeta {
   id: string;
   head: string;
@@ -705,10 +719,11 @@ async function forwardOnce(
       `in=${input}`,
       `out=${readUsage(text, "output_tokens")}`,
     ].join(" ");
+    const probe = probeResponse(text);
     const raw = !upstream.ok || input === "-"
       ? `\n  RAW ct=${upstream.headers.get("content-type") ?? "-"} <${text.slice(0, 600).replace(/\s+/g, " ")}>`
       : "";
-    record(`${meta.head}\n  ${usage}${raw}`, !upstream.ok);
+    record(`${meta.head}\n  ${usage} probe=${probe}${raw}`, !upstream.ok);
 
     const out = responseHeaders(upstream.headers, meta.id);
     out.set("content-type", "text/event-stream; charset=utf-8");
@@ -741,12 +756,14 @@ async function forwardOnce(
         `out=${readUsage(text, "output_tokens")}`,
       ].join(" ");
 
+      const probe = probeResponse(text);
+
       const raw = !upstream.ok || input === "-"
         ? `\n  RAW ct=${upstream.headers.get("content-type") ?? "-"} <${
           text.slice(0, 600).replace(/\s+/g, " ")
         }>`
         : "";
-      record(`${meta.head}\n  ${usage}${raw}`, !upstream.ok);
+      record(`${meta.head}\n  ${usage} probe=${probe}${raw}`, !upstream.ok);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       record(`${meta.head}\n  attempt=1 usage-log-error=${message}`, true);
@@ -876,8 +893,9 @@ async function handler(req: Request): Promise<Response> {
   const bpIn = scanBreakpoints(body);
   const removedRuntime = removeOldRuntimeBlocks(body);
 
+  const INJECT_CACHE = Deno.env.get("INJECT_CACHE") !== "0"; // 验水模式：INJECT_CACHE=0 纯透传不改内容
   let cacheNote = "off";
-  if (CACHE_ENABLED) {
+  if (CACHE_ENABLED && INJECT_CACHE) {
     const result = isMessagesPath(path)
       ? (BREAKPOINT_MODE === "all"
         ? injectAnthropicAll(body, TAIL_BREAKPOINTS)
