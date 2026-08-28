@@ -576,6 +576,21 @@ function readUsage(text: string, key: string): string {
 }
 
 /** 验水指纹：从上游响应体提取思考/签名/空完成证据。 */
+/** 解码 Anthropic 思考签名中的模型标识（官方签名内置模型名，防伪）。 */
+function sigModelOf(text: string): string {
+  const m = text.match(/"signature"\s*:\s*"([^"]+)"/);
+  if (!m) return "-";
+  const sig = m[1];
+  try {
+    const bin = atob(sig);
+    const mm = bin.match(/claude-[a-z0-9-]+/i);
+    if (mm) return mm[0];
+  } catch {
+    // 非标准 base64 或截断，忽略
+  }
+  return `raw:${sig.slice(0, 24)}...`;
+}
+
 function probeResponse(text: string): string {
   const hasThinking = text.includes('"type":"thinking"') || text.includes('"type": "thinking"') || text.includes('"reasoning"');
   const hasSignature = text.includes('"signature"');
@@ -583,7 +598,7 @@ function probeResponse(text: string): string {
     ? readUsage(text, "thinking_tokens")
     : readUsage(text, "reasoning_tokens");
   const hasEmpty = text.includes('"content":[]') && text.includes('"stop_reason":"end_turn"');
-  const parts = [`think=${hasThinking ? "Y" : "N"}`, `sig=${hasSignature ? "Y" : "N"}`];
+  const parts = [`think=${hasThinking ? "Y" : "N"}`, `sig=${hasSignature ? "Y" : "N"}`, `sigModel=${sigModelOf(text)}`];
   if (thinkTok !== "-") parts.push(`thinkTok=${thinkTok}`);
   if (hasEmpty) parts.push(`EMPTY=YES`);
   return parts.join(" ");
