@@ -45,7 +45,7 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3.2-probe";
+const VERSION = "v3.3-stream";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -64,6 +64,7 @@ const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
+const STREAM_UPSTREAM = Deno.env.get("STREAM_UPSTREAM") !== "0";
 const FORCE_HTTPS = Deno.env.get("FORCE_HTTPS") !== "0";
 const PORT = Number(Deno.env.get("PORT") || 8000);
 
@@ -609,10 +610,192 @@ interface ForwardMeta {
   head: string;
   path: string;
   convertSse?: boolean;
+  streamUpstream?: boolean;
 }
 
 function sseFrame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}`;
+}
+
+/**
+ * STREAM_UPSTREAM 模式：向上游发 stream=true 真流式，把上游 SSE 流标准化后转发给客户端。
+ * - thinking_delta 明文原样透传（New API 网关在非流式下会剥离 thinking 字段，流式下可能返回）
+ * - 防空完成防护：去重 message_start/message_stop、忽略坏帧、流中断时补发 message_stop
+ */
+function parseSseFrame(frame: string): { event: string; data: string } | null {
+  let event = "message";
+  const dataLines: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (dataLines.length === 0) return null;
+  return { event, data: dataLines.join("\n") };
+}
+
+async function streamForward(
+  upstream: Response,
+  meta: ForwardMeta,
+  elapsed: number,
+): Promise<Response> {
+  const started = performance.now();
+  const out = responseHeaders(upstream.headers, meta.id);
+  out.set("content-type", "text/event-stream; charset=utf-8");
+  out.set("cache-control", "no-cache");
+  if (upstream.status !== 200) {
+    // 非 200：尝试读完整 body 转 error SSE，避免客户端挂起
+    let text = "";
+    try { text = await new Response(upstream.body).text(); } catch { /* ignore */ }
+    const ev = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "upstream_error", message: text.slice(0, 300) } })}\n\n`;
+    const finish = `event: message_stop\ndata: {"type":"message_stop"}\n\n`;
+    new TextEncoder();
+    return new Response(new TextEncoder().encode(ev + finish), { status: upstream.status, headers: out });
+  }
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let closed = false;
+  let sawFirst = false;
+  let sawStop = false;
+  let pendingStop = false;
+  const thinkParts: string[] = [];
+  const textParts: string[] = [];
+  let sigCount = 0;
+  let firstSig = "";
+  let usageJson = "";
+  const frameCount = { n: 0 };
+
+  const finishFrame = 'event: message_stop\ndata: {"type":"message_stop"}';
+
+  const readable = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const push = (s: string): void => {
+        if (!closed) controller.enqueue(encoder.encode(s + "\n\n"));
+      };
+      const logMeta = () => {
+        const thinkText = thinkParts.join("");
+        const text = textParts.join("");
+        const usage = [
+          `attempt=1`,
+          `status=${upstream.status}`,
+          `ms=${elapsed}`,
+          `len=${(thinkText + text).length}`,
+          `read=${readUsage(usageJson, "cache_read_input_tokens")}`,
+          `create=${readUsage(usageJson, "cache_creation_input_tokens")}`,
+          `w1h=${readUsage(usageJson, "ephemeral_1h_input_tokens")}`,
+          `w5m=${readUsage(usageJson, "ephemeral_5m_input_tokens")}`,
+          `in=${readUsage(usageJson, "input_tokens")}`,
+          `out=${readUsage(usageJson, "output_tokens")}`,
+        ].join(" ");
+        const thinkTok = readUsage(usageJson, "thinking_tokens");
+        const probeParts = [
+          `think=${thinkParts.length > 0 ? "Y" : "N"}`,
+          `sig=${sigCount > 0 ? "Y" : "N"}`,
+          `sigModel=${firstSig ? sigModelOf(JSON.stringify({ signature: firstSig })) : "-"}`,
+          `thinkTok=${thinkTok !== "-" ? thinkTok : (thinkParts.length > 0 ? String(Math.max(1, Math.round(thinkText.length / 4))) : "-")}`,
+          `thinkLen=${thinkText.length}`,
+          `frames=${frameCount.n}`,
+        ].join(" ");
+        record(`${meta.head}\n  ${usage} probe=${probeParts} mode=stream`, !upstream.ok);
+      };
+      const finish = () => {
+        if (closed) return;
+        if (!sawStop) push(finishFrame);
+        closed = true;
+        try { controller.close(); } catch { /* ignore */ }
+        try { logMeta(); } catch { /* ignore */ }
+      };
+      try {
+        const reader = upstream.body?.getReader();
+        if (!reader) { finish(); return; }
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx = buffer.indexOf("\n\n");
+          while (idx >= 0) {
+            const frame = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 2);
+            idx = buffer.indexOf("\n\n");
+            if (!frame.trim()) continue;
+            const parsed = parseSseFrame(frame);
+            if (!parsed) continue;
+            let dataObj: Any;
+            try { dataObj = JSON.parse(parsed.data); } catch { continue; }
+            const type = dataObj?.type ?? parsed.event;
+            if (type === "message_start") {
+              if (sawFirst) continue; // 去重
+              sawFirst = true;
+              push("event: message_start\ndata: " + parsed.data);
+            } else if (type === "content_block_start") {
+              const cb = isObj(dataObj.content_block) ? dataObj.content_block : {};
+              if (cb.type === "thinking" && typeof cb.signature === "string") {
+                sigCount++;
+                if (!firstSig) firstSig = cb.signature;
+              }
+              push("event: content_block_start\ndata: " + parsed.data);
+            } else if (type === "content_block_delta") {
+              const d = isObj(dataObj.delta) ? dataObj.delta : {};
+              if (d.type === "thinking_delta" && typeof d.thinking === "string") thinkParts.push(d.thinking);
+              if (d.type === "text_delta" && typeof d.text === "string") textParts.push(d.text);
+              push("event: content_block_delta\ndata: " + parsed.data);
+            } else if (type === "content_block_stop") {
+              push("event: content_block_stop\ndata: " + parsed.data);
+            } else if (type === "message_delta") {
+              if (isObj(dataObj.usage)) usageJson = JSON.stringify(dataObj.usage);
+              push("event: message_delta\ndata: " + parsed.data);
+            } else if (type === "message_stop") {
+              sawStop = true; // 不立即转发，确保总是最后一个事件
+            } else if (type === "ping") {
+              push("event: ping\ndata: " + parsed.data);
+            } else if (type === "error") {
+              push("event: error\ndata: " + parsed.data);
+            }
+            frameCount.n++;
+          }
+        }
+        // 上游流结束：保证 message_stop 恰好一次、且为最后一个事件
+        const tail = decoder.decode(); // 冲刷剩余字节
+        if (tail) {
+          buffer += tail;
+          const idx = buffer.indexOf("\n\n");
+          if (idx >= 0) {
+            const frame = buffer.slice(0, idx);
+            if (frame.trim()) {
+              const parsed = parseSseFrame(frame);
+              if (parsed) {
+                try {
+                  const dataObj = JSON.parse(parsed.data);
+                  const type = dataObj?.type ?? parsed.event;
+                  if (type !== "message_stop") {
+                    push("event: content_block_stop\ndata: " + parsed.data);
+                  } else {
+                    sawStop = true;
+                  }
+                } catch { /* ignore */ }
+              }
+            }
+          }
+        }
+        if (!sawStop) {
+          // 上游没发 stop：补发（防止客户端空完成/挂起）
+        }
+        push(finishFrame);
+        closed = true;
+        try { controller.close(); } catch { /* ignore */ }
+        try { logMeta(); } catch { /* ignore */ }
+      } catch (error) {
+        // 读流异常：不抛错，补终止事件
+        try { finish(); } catch { /* ignore */ }
+      }
+    },
+    cancel() {
+      closed = true;
+    },
+  });
+
+  return new Response(readable, { status: upstream.status, headers: out });
 }
 
 /**
@@ -710,6 +893,10 @@ async function forwardOnce(
   }
 
   const elapsed = Math.round(performance.now() - started);
+
+  if (meta.streamUpstream) {
+    return await streamForward(upstream, meta, elapsed);
+  }
 
   if (meta.convertSse) {
     // Upstream was called with stream=false and returns full JSON; convert to SSE.
@@ -834,6 +1021,7 @@ async function handler(req: Request): Promise<Response> {
       currentTimeInjection: TIME_ENABLED,
       timeZone: TIME_ZONE,
       forceNonStream: FORCE_NON_STREAM,
+      streamUpstream: STREAM_UPSTREAM,
       forceHttps: FORCE_HTTPS,
       upstreamAttemptsPerIncomingRequest: 1,
       logsInThisInstance: LOG_LINES.length,
@@ -936,7 +1124,12 @@ async function handler(req: Request): Promise<Response> {
   // v2: force non-stream (Anthropic messages path + incoming stream only)
   let streamNote = "passthrough";
   let convertSse = false;
-  if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
+  let streamUpstream = false;
+  if (STREAM_UPSTREAM && isMessagesPath(path)) {
+    body.stream = true;
+    streamNote = "forced-true+std";
+    streamUpstream = true;
+  } else if (FORCE_NON_STREAM && isMessagesPath(path) && body?.stream === true) {
     body.stream = false;
     streamNote = "forced-false+sse";
     convertSse = true;
@@ -971,7 +1164,7 @@ async function handler(req: Request): Promise<Response> {
     target,
     headers,
     JSON.stringify(body),
-    { id, head, path, convertSse },
+    { id, head, path, convertSse, streamUpstream },
   );
 }
 
