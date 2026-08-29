@@ -1,34 +1,37 @@
 // ============================================================
-//  xyc-proxy v8-passthrough — 原生透传 + 完整诊断日志
+//  xyc-proxy v8.5-opus5-1h — passion 专用: opus5 全量 1h 缓存 + 完整诊断日志
 //  ------------------------------------------------------------
-//  覆盖仓库根目录 main.ts 后 push main，Zeabur 自动重部署。
-//  运行: deno run --allow-net --allow-env --allow-read main.ts
-//
-//  行为:
-//    - POST /v1/messages : 请求体/请求头 一字不改原样转发到 UPSTREAM_URL，
-//      客户端 stream 属性原样保留（不做非流式强制）。
-//    - 所有诊断仅在本地计算/记录，绝不回写请求。
-//    - /logs /logs.json /logs/clear 保留；非 API 路径默认也透传（仅记一行）。
+//  基于 v8-passthrough。默认原生透传；仅当请求 model 匹配 opus5 时：
+//    - 所有 cache_control 统一为 {type:"ephemeral", ttl:"1h"}
+//    - 所有内容块(system 每一块 / 每条 message 的每一个块 / 每个 tool)
+//      都打上 1h 断点，字符串型 content 会转成块以便标记
+//    - 确保 anthropic-beta 头包含 extended-cache-ttl-2025-04-11
+//  其他模型完全不受影响(纯透传)。
 //
 //  环境变量:
 //    UPSTREAM_URL       默认 https://passion8.cc   (不要带尾斜杠)
+//    UPGRADE_CACHE      1|0  默认 1(opus5 全量 1h); 置 0 退回纯透传
 //    PROXY_TOKEN        可选；设置后 /logs* 需带 ?proxy_token= 或 x-proxy-token
-//    LOG_BODY           1|0  默认 1（记录入站完整 body，单条封顶 50KB）
-//    MAX_LOGS           默认 250（内存日志条数，重启即失）
-//    PASSTHROUGH_OTHER  1|0  默认 1（非 /v1/messages 路径透传+一行日志）
-//    RETRY              0|1  默认 0（上游失败是否重试一次）
-//  注意: FORCE_NON_STREAM / CACHE_TTL_ON / INJECT_CURRENT_TIME /
-//        BREAKPOINT_MODE 在透传模式下不再生效，可以删除。
+//    LOG_BODY           1|0  默认 1(记录出站 body, 单条封顶 50KB)
+//    MAX_LOGS           默认 250(内存日志条数, 重启即失)
+//    PASSTHROUGH_OTHER  1|0  默认 1(非 /v1/messages 路径透传+一行日志)
+//    RETRY              0|1  默认 0(上游失败是否重试一次)
 // ============================================================
 
-const VERSION = "v8-passthrough";
+const VERSION = "v8.5-opus5-1h";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
 const MAX_LOGS = Math.max(10, parseInt(Deno.env.get("MAX_LOGS") ?? "250", 10) || 250);
 const PASSTHROUGH_OTHER = Deno.env.get("PASSTHROUGH_OTHER") !== "0";
 const RETRY = Deno.env.get("RETRY") === "1";
+const UPGRADE_CACHE = Deno.env.get("UPGRADE_CACHE") !== "0";
 const BODY_CAP = 50000;
+const TTL = "1h";
+const BETA_1H = "extended-cache-ttl-2025-04-11";
+const OPUS5_RE = /opus-?5/i;
+// 历史残留时间块标记(分解写法, 避免文档管道误当作 HTML 注释)
+const TIME_MARKER = "<" + "!-- pxy8-proxy-runtime-time-v1 --" + ">";
 
 // ---------- 小工具 ----------
 function fnv(s: string): string {
@@ -49,7 +52,7 @@ function json(o: unknown, status = 200): Response {
   return new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
 }
 
-// ---------- 日志存储（内存，重启即失） ----------
+// ---------- 日志存储(内存, 重启即失) ----------
 interface LogEntry {
   id: string;
   t: string;
@@ -72,17 +75,33 @@ function pushLine(e: LogEntry, s: string) {
   console.log(`[${VERSION}] ${s}`);
 }
 
-// ---------- 请求体解析（只读，不改动任何东西） ----------
+// ---------- 请求体解析(只读) ----------
 function stripStableTime(s: string): string {
-  // 仅用于稳定性哈希：剔除历史残留的时间注入块（透传请求本身绝不修改）
   return s
-    .replace(/<!-- pxy8-proxy-runtime-time-v1 -->/g, "")
+    .split(TIME_MARKER).join("")
     .replace(/<runtime_context[\s\S]*?<\/runtime_context>/g, "");
 }
-function scanBody(raw: string) {
+interface ScanResult {
+  model: string;
+  stream: string;
+  roles: string;
+  rawLen: number;
+  msgHashes: string[];
+  bpCount: number;
+  bpPos: string[];
+  sysHash: string;
+  sysLen: number;
+  toolsHash: string;
+  toolsLen: number;
+  msgStable: string;
+  parsed: any;
+  st: { hasPrev: boolean; stable: boolean; common: number; firstDiff: number };
+  opus5: boolean;
+}
+function scanBody(raw: string): ScanResult {
   let parsed: any = null;
   try { parsed = JSON.parse(raw); } catch { /* 透传不受影响 */ }
-  const model = parsed?.model ?? "-";
+  const model = String(parsed?.model ?? "-");
   const stream = typeof parsed?.stream === "boolean" ? String(parsed.stream) : (parsed?.stream === "true" ? "true" : "?");
   const msgs: any[] = parsed?.messages ?? [];
   const roles = msgs.map((m: any) => m?.role?.[0] ?? "?").join("");
@@ -143,10 +162,60 @@ function scanBody(raw: string) {
     sysHash: fnv(sysStr), sysLen: sysStr.length,
     toolsHash: fnv(toolsStr), toolsLen: toolsStr.length,
     msgStable, parsed, st,
+    opus5: OPUS5_RE.test(model),
   };
 }
 
-// ---------- 上游转发（原样） ----------
+// ---------- opus5 全量 1h 改写 ----------
+function rewrite1h(raw: string): { body: string; n: number } | null {
+  let parsed: any;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  if (!parsed || typeof parsed !== "object") return null;
+  if (!OPUS5_RE.test(String(parsed.model ?? ""))) return null;
+
+  const bp = { type: "ephemeral", ttl: TTL };
+  let n = 0;
+  const mark = (block: any): void => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return;
+    const old = block.cache_control;
+    const oldTtl = old?.ttl ?? "";
+    block.cache_control = { ...bp };
+    if (oldTtl !== TTL) n++;
+  };
+
+  // system: 字符串 → 包成块; 数组 → 逐块标记
+  if (typeof parsed.system === "string") {
+    if ((parsed.system as string).length) {
+      parsed.system = [{ type: "text", text: parsed.system, cache_control: { ...bp } }];
+      n++;
+    }
+  } else if (Array.isArray(parsed.system)) {
+    parsed.system.forEach(mark);
+  }
+
+  // messages: 每条 message 的 content 逐块标记; 字符串 content → 包成块
+  const msgs: any[] = parsed.messages ?? [];
+  msgs.forEach((m: any) => {
+    if (!m || typeof m !== "object") return;
+    const c = m.content;
+    if (typeof c === "string") {
+      if (c.length) {
+        m.content = [{ type: "text", text: c, cache_control: { ...bp } }];
+        n++;
+      }
+    } else if (Array.isArray(c)) {
+      c.forEach(mark);
+    }
+  });
+
+  // tools: 每个 tool 都标记
+  const tools: any[] = parsed.tools ?? [];
+  tools.forEach(mark);
+
+  return { body: JSON.stringify(parsed), n };
+}
+
+// ---------- 上游转发 ----------
 function extractUsage(t: string): string | null {
   const fields: [string, RegExp][] = [
     ["in", /"input_tokens"\s*:\s*(\d+)/],
@@ -192,13 +261,20 @@ function collect(e: LogEntry, stream: ReadableStream<Uint8Array>, status: number
   })();
 }
 
-async function forwardMessage(e: LogEntry, raw: string, req: Request): Promise<Response> {
+async function forwardMessage(e: LogEntry, raw: string, req: Request, rewN: number): Promise<Response> {
   const url = `${UPSTREAM}/v1/messages`;
   const headers = new Headers(req.headers);
   headers.delete("host");
   headers.delete("connection");
   headers.delete("transfer-encoding");
   headers.delete("x-proxy-token"); // 不透传代理自用 token 给上游
+  if (rewN > 0) {
+    // 保证 1h 生效所需的 beta 头
+    const beta = headers.get("anthropic-beta") || "";
+    if (!beta.includes(BETA_1H)) {
+      headers.set("anthropic-beta", beta ? `${beta} ${BETA_1H}` : BETA_1H);
+    }
+  }
   const t0 = Date.now();
 
   const attempt = async (): Promise<{ resp: Response; ms: number }> => {
@@ -235,16 +311,20 @@ async function forwardMessage(e: LogEntry, raw: string, req: Request): Promise<R
   }
 }
 
-function summaryLine(e: LogEntry, req: Request, s: ReturnType<typeof scanBody>) {
-  let head = `#${e.id} ${e.t} path=/v1/messages model=${s.model} ` +
-    `prompt=${fnv(JSON.stringify(s.parsed?.messages ?? []))}/${s.rawLen} ` +
-    `sys=${s.sysHash}/${s.sysLen} tools=${s.toolsHash}/${s.toolsLen} ` +
-    `msgs=${s.roles} stream=${s.stream} mode=native`;
-  head += s.bpCount ? ` bpIn=${s.bpCount}[${s.bpPos.join(",")}]` : " bpIn=0";
-  head += s.st.hasPrev
-    ? ` prefixStable=${s.st.stable} common=${s.st.common} firstDiff=${s.st.firstDiff}`
-    : " firstRequest";
-  head += ` betaIn=${req.headers.get("anthropic-beta") || "-"}`;
+function summaryLine(e: LogEntry, req: Request, sIn: ScanResult, sOut: ScanResult, rewN: number) {
+  const head =
+    `#${e.id} ${e.t} path=/v1/messages model=${sOut.model} ` +
+    `prompt=${fnv(JSON.stringify(sOut.parsed?.messages ?? []))}/${sOut.rawLen} ` +
+    `sys=${sOut.sysHash}/${sOut.sysLen} tools=${sOut.toolsHash}/${sOut.toolsLen} ` +
+    `msgs=${sOut.roles} stream=${sOut.stream} ` +
+    (rewN > 0 ? `rewrite=5m->1h:{${rewN}} ` : `rewrite=none `) +
+    (sIn.bpCount ? `bpIn=${sIn.bpCount}[${sIn.bpPos.join(",")}]` : "bpIn=0") +
+    (sOut.bpCount ? ` bpOut=${sOut.bpCount}[${sOut.bpPos.join(",")}]` : "") +
+    (sOut.st.hasPrev
+      ? ` prefixStable=${sOut.st.stable} common=${sOut.st.common} firstDiff=${sOut.st.firstDiff}`
+      : " firstRequest") +
+    ` betaIn=${req.headers.get("anthropic-beta") || "-"}` +
+    (rewN > 0 ? ` betaOut=${BETA_1H}` : "");
   pushLine(e, head);
 }
 
@@ -283,7 +363,7 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/" || p === "/health") {
     return json({
       ok: true, provider: "passion8", version: VERSION,
-      upstream: UPSTREAM, mode: "native-passthrough", rewrite: "none",
+      upstream: UPSTREAM, mode: "passthrough+opus5-1h", rewrite: UPGRADE_CACHE ? "opus5->1h-all" : "none",
       forceNonStream: false, logsInThisInstance: logs.length,
       maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
     });
@@ -304,10 +384,21 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/v1/messages" && req.method === "POST") {
     const raw = await req.text();
     const e = addEntry();
-    const s = scanBody(raw);
-    summaryLine(e, req, s);
-    if (LOG_BODY) e.body = brief(raw, BODY_CAP);
-    return await forwardMessage(e, raw, req);
+    const sIn = scanBody(raw);
+    let outRaw = raw;
+    let rewN = 0;
+    let sOut = sIn;
+    if (UPGRADE_CACHE && sIn.opus5) {
+      const r = rewrite1h(raw);
+      if (r) {
+        outRaw = r.body;
+        rewN = r.n;
+        sOut = scanBody(outRaw); // 前缀稳定性按实际出站体计算
+      }
+    }
+    summaryLine(e, req, sIn, sOut, rewN);
+    if (LOG_BODY) e.body = brief(outRaw, BODY_CAP);
+    return await forwardMessage(e, outRaw, req, rewN);
   }
   if (PASSTHROUGH_OTHER) return await passthroughGeneric(req, p);
   return json({ error: "not found" }, 404);
@@ -315,5 +406,5 @@ async function handle(req: Request): Promise<Response> {
 
 // ---------- 启动 ----------
 const port = parseInt(Deno.env.get("PORT") || "8080", 10);
-console.log(`${VERSION} upstream=${UPSTREAM} port=${port} LOG_BODY=${LOG_BODY} MAX_LOGS=${MAX_LOGS} PROXY_TOKEN=${PROXY_TOKEN ? "set" : "none"}`);
+console.log(`${VERSION} upstream=${UPSTREAM} port=${port} UPGRADE_CACHE=${UPGRADE_CACHE} LOG_BODY=${LOG_BODY} MAX_LOGS=${MAX_LOGS} PROXY_TOKEN=${PROXY_TOKEN ? "set" : "none"}`);
 Deno.serve({ port }, handle);
