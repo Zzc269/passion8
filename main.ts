@@ -45,7 +45,7 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3.4-bodylog";
+const VERSION = "v3.4.1-bodylog";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -63,7 +63,7 @@ const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "message").toLowerCa
 const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
-const LOG_BODY = Deno.env.get("LOG_BODY") === "1";
+const LOG_BODY = Deno.env.get("LOG_BODY") !== "0"; // default ON; LOG_BODY=0 disables
 const FORCE_NON_STREAM = Deno.env.get("FORCE_NON_STREAM") !== "0";
 const STREAM_UPSTREAM = Deno.env.get("STREAM_UPSTREAM") !== "0";
 const FORCE_HTTPS = Deno.env.get("FORCE_HTTPS") !== "0";
