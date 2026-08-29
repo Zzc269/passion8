@@ -45,7 +45,7 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3.4.2-fullog";
+const VERSION = "v3.4.4-errraw";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -646,12 +646,13 @@ async function streamForward(
   out.set("content-type", "text/event-stream; charset=utf-8");
   out.set("cache-control", "no-cache");
   if (upstream.status !== 200) {
-    // 非 200：尝试读完整 body 转 error SSE，避免客户端挂起
+    // 非 200：读完整 body 记录 RAW 到日志，并转 error SSE 给客户端
     let text = "";
     try { text = await new Response(upstream.body).text(); } catch { /* ignore */ }
+    const errMs = Math.round(performance.now() - started);
+    record(`${meta.head}\n  attempt=1 status=${upstream.status} ms=${errMs} len=${text.length} ERR-BODY <${text.slice(0, 4000).replace(/\s+/g, " ")}>`, true);
     const ev = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "upstream_error", message: text.slice(0, 300) } })}\n\n`;
     const finish = `event: message_stop\ndata: {"type":"message_stop"}\n\n`;
-    new TextEncoder();
     return new Response(new TextEncoder().encode(ev + finish), { status: upstream.status, headers: out });
   }
 
