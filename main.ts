@@ -1,13 +1,10 @@
 // ============================================================
-//  xyc-proxy v8.6-opus5-1h-time — passion 专用
+//  xyc-proxy v8.7-opus5-1h-sys — passion 专用
 //  ------------------------------------------------------------
-//  在 v8.5 基础上:
-//    - 剔除历史动态时间块(当前北京时间/Current time/runtime_context/旧标记)
-//      -> 消息前缀字节稳定, 缓存可命中
-//    - 在最后一条 message 末尾(缓存断点之后)重新注入当前时间
-//      (Asia/Shanghai, 精确到分, 不带 cache_control)
-//    - /logs.json 增加 body 字段, /logs 文本也输出 BODY
-//  其余同 v8.5: opus5 -> 全内容块 1h + beta 头; 其他模型纯透传。
+//  在 v8.6 基础上新增: opus5 出站时剔除 system 中的动态
+//    <topic_reference_context>...</topic_reference_context> 与包装注释
+//    (保留静态 context.instruction), 消除话题摘要漂移导致的前缀不稳
+//  其余行为同 v8.6: sanitize 动态时间块 + 全块 1h + 末尾注入时间
 //
 //  环境变量:
 //    UPSTREAM_URL       默认 https://passion8.cc
@@ -21,7 +18,7 @@
 //    RETRY              0|1  默认 0
 // ============================================================
 
-const VERSION = "v8.6-opus5-1h-time";
+const VERSION = "v8.7-opus5-1h-sys";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -93,6 +90,11 @@ function sanitizeTimeText(s: string): string {
   const keep = lines.filter((ln) => !/(当前时间|当前北京时间|Current time|北京时间)\s*[：:]/.test(ln));
   return keep.join("\n");
 }
+function sanitizeSystemText(s: string): string {
+  return s
+    .replace(/<topic_reference_context>[\s\S]*?<\/topic_reference_context>/g, "")
+    .replace(/<!--\s*SYSTEM CONTEXT[\s\S]*?END SYSTEM CONTEXT\s*-->/g, "");
+}
 
 // ---------- 请求体解析(只读) ----------
 interface ScanResult {
@@ -144,7 +146,17 @@ function scanBody(raw: string): ScanResult {
   });
 
   const sys: any = parsed?.system;
-  const sysStr = typeof sys === "string" ? (SANITIZE_TIME ? sanitizeTimeText(sys) : sys) : JSON.stringify(sys ?? []);
+  const sysStr = typeof sys === "string"
+    ? (SANITIZE_TIME ? sanitizeSystemText(sanitizeTimeText(sys)) : sys)
+    : JSON.stringify((sys ?? []).map((b: any) => {
+        if (b && typeof b === "object" && typeof b.text === "string") {
+          const cp = { ...b };
+          delete cp.cache_control;
+          cp.text = SANITIZE_TIME ? sanitizeSystemText(sanitizeTimeText(b.text)) : b.text;
+          return cp;
+        }
+        return b;
+      }));
   if (Array.isArray(sys)) {
     sys.forEach((s: any, i: number) => {
       if (s && s.cache_control) { bpCount++; bpPos.push(`sys${i}:${s.cache_control.ttl ?? s.cache_control.type ?? "?"}`); }
@@ -199,14 +211,24 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
     if (oldTtl !== TTL) n++;
   };
 
-  // system: 字符串 → 包成块; 数组 → 逐块标记
+  // system: 字符串 → 包成块; 数组 → 逐块标记(文本先过 topic 剔除)
+  const cleanSysBlock = (block: any): void => {
+    if (SANITIZE_TIME && block && typeof block === "object" && typeof block.text === "string") {
+      block.text = sanitizeSystemText(sanitizeTimeText(block.text));
+    }
+    mark(block);
+  };
   if (typeof parsed.system === "string") {
     if ((parsed.system as string).length) {
-      parsed.system = [{ type: "text", text: clean(parsed.system), cache_control: { ...bp } }];
+      parsed.system = [{
+        type: "text",
+        text: clean(parsed.system),
+        cache_control: { ...bp },
+      }];
       n++;
     }
   } else if (Array.isArray(parsed.system)) {
-    parsed.system.forEach(mark);
+    parsed.system.forEach(cleanSysBlock);
   }
 
   // messages: 逐块标记; 字符串 content → 包成块
@@ -392,8 +414,8 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/" || p === "/health") {
     return json({
       ok: true, provider: "passion8", version: VERSION,
-      upstream: UPSTREAM, mode: "passthrough+opus5-1h(time-stable)",
-      rewrite: UPGRADE_CACHE ? "opus5->1h-all+sanitize-time+inject-time" : "none",
+      upstream: UPSTREAM, mode: "passthrough+opus5-1h(sys-stable)",
+      rewrite: UPGRADE_CACHE ? "opus5->1h-all+sanitize-time+inject-time+sys-stable" : "none",
       sanitizeTime: SANITIZE_TIME, injectTime: INJECT_TIME, forceNonStream: false,
       logsInThisInstance: logs.length, maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
     });
