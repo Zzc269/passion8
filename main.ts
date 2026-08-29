@@ -45,7 +45,7 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3.4.1-bodylog";
+const VERSION = "v3.4.2-fullog";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
 const TTL = "1h";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
@@ -182,10 +182,12 @@ function clock(): string {
   return formatTime(new Date(), true).replace("T", " ");
 }
 
-function record(line: string, forceConsole = false): void {
+function record(line: string, _forceConsole = false): void {
   LOG_LINES.push(line);
-  if (LOG_LINES.length > 300) LOG_LINES.shift();
-  if (DEBUG || forceConsole) console.log(line);
+  if (LOG_LINES.length > 1000) LOG_LINES.shift();
+  // Always emit to stdout: Zeabur Runtime Logs persist every request
+  // (memory /logs is a restart-wiped mirror of the same lines).
+  console.log(line);
 }
 
 function shortHash(v: unknown): string {
