@@ -1,24 +1,27 @@
 // ============================================================
-//  xyc-proxy v8.5-opus5-1h — passion 专用: opus5 全量 1h 缓存 + 完整诊断日志
+//  xyc-proxy v8.6-opus5-1h-time — passion 专用
 //  ------------------------------------------------------------
-//  基于 v8-passthrough。默认原生透传；仅当请求 model 匹配 opus5 时：
-//    - 所有 cache_control 统一为 {type:"ephemeral", ttl:"1h"}
-//    - 所有内容块(system 每一块 / 每条 message 的每一个块 / 每个 tool)
-//      都打上 1h 断点，字符串型 content 会转成块以便标记
-//    - 确保 anthropic-beta 头包含 extended-cache-ttl-2025-04-11
-//  其他模型完全不受影响(纯透传)。
+//  在 v8.5 基础上:
+//    - 剔除历史动态时间块(当前北京时间/Current time/runtime_context/旧标记)
+//      -> 消息前缀字节稳定, 缓存可命中
+//    - 在最后一条 message 末尾(缓存断点之后)重新注入当前时间
+//      (Asia/Shanghai, 精确到分, 不带 cache_control)
+//    - /logs.json 增加 body 字段, /logs 文本也输出 BODY
+//  其余同 v8.5: opus5 -> 全内容块 1h + beta 头; 其他模型纯透传。
 //
 //  环境变量:
-//    UPSTREAM_URL       默认 https://passion8.cc   (不要带尾斜杠)
-//    UPGRADE_CACHE      1|0  默认 1(opus5 全量 1h); 置 0 退回纯透传
-//    PROXY_TOKEN        可选；设置后 /logs* 需带 ?proxy_token= 或 x-proxy-token
-//    LOG_BODY           1|0  默认 1(记录出站 body, 单条封顶 50KB)
-//    MAX_LOGS           默认 250(内存日志条数, 重启即失)
-//    PASSTHROUGH_OTHER  1|0  默认 1(非 /v1/messages 路径透传+一行日志)
-//    RETRY              0|1  默认 0(上游失败是否重试一次)
+//    UPSTREAM_URL       默认 https://passion8.cc
+//    UPGRADE_CACHE      1|0  默认 1
+//    SANITIZE_TIME      1|0  默认 1(剔除动态时间块)
+//    INJECT_TIME        1|0  默认 1(末尾注入当前时间)
+//    PROXY_TOKEN        /logs* 保护
+//    LOG_BODY           1|0  默认 1
+//    MAX_LOGS           默认 250
+//    PASSTHROUGH_OTHER  1|0  默认 1
+//    RETRY              0|1  默认 0
 // ============================================================
 
-const VERSION = "v8.5-opus5-1h";
+const VERSION = "v8.6-opus5-1h-time";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -26,12 +29,12 @@ const MAX_LOGS = Math.max(10, parseInt(Deno.env.get("MAX_LOGS") ?? "250", 10) ||
 const PASSTHROUGH_OTHER = Deno.env.get("PASSTHROUGH_OTHER") !== "0";
 const RETRY = Deno.env.get("RETRY") === "1";
 const UPGRADE_CACHE = Deno.env.get("UPGRADE_CACHE") !== "0";
+const SANITIZE_TIME = Deno.env.get("SANITIZE_TIME") !== "0";
+const INJECT_TIME = Deno.env.get("INJECT_TIME") !== "0";
 const BODY_CAP = 50000;
 const TTL = "1h";
 const BETA_1H = "extended-cache-ttl-2025-04-11";
 const OPUS5_RE = /opus-?5/i;
-// 历史残留时间块标记(分解写法, 避免文档管道误当作 HTML 注释)
-const TIME_MARKER = "<" + "!-- pxy8-proxy-runtime-time-v1 --" + ">";
 
 // ---------- 小工具 ----------
 function fnv(s: string): string {
@@ -50,6 +53,11 @@ function rid(): string { return Math.random().toString(16).slice(2, 10); }
 function brief(s: string, n: number): string { return s.length > n ? s.slice(0, n) + "...[cut]" : s; }
 function json(o: unknown, status = 200): Response {
   return new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+}
+function nowMinute(): string {
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
 // ---------- 日志存储(内存, 重启即失) ----------
@@ -75,12 +83,18 @@ function pushLine(e: LogEntry, s: string) {
   console.log(`[${VERSION}] ${s}`);
 }
 
-// ---------- 请求体解析(只读) ----------
-function stripStableTime(s: string): string {
-  return s
-    .split(TIME_MARKER).join("")
-    .replace(/<runtime_context[\s\S]*?<\/runtime_context>/g, "");
+// ---------- 动态时间块剔除(仅影响出站体与稳定性哈希) ----------
+function sanitizeTimeText(s: string): string {
+  let out = s
+    .replace(/<runtime_context[\s\S]*?<\/runtime_context>/g, "")
+    .replace(/<!--\s*pxy8-proxy-runtime-time-v1\s*-->/g, "")
+    .replace(/<!--[^>]*(?:当前时间|当前北京时间|Current time)[^>]*-->/g, "");
+  const lines = out.split("\n");
+  const keep = lines.filter((ln) => !/(当前时间|当前北京时间|Current time|北京时间)\s*[：:]/.test(ln));
+  return keep.join("\n");
 }
+
+// ---------- 请求体解析(只读) ----------
 interface ScanResult {
   model: string;
   stream: string;
@@ -113,12 +127,12 @@ function scanBody(raw: string): ScanResult {
   msgs.forEach((m: any, i: number) => {
     const content = m?.content;
     let stable: string;
-    if (typeof content === "string") stable = stripStableTime(content);
+    if (typeof content === "string") stable = SANITIZE_TIME ? sanitizeTimeText(content) : content;
     else if (Array.isArray(content)) {
       const textOnly = content
         .filter((b: any) => typeof b === "object" && b?.type === "text")
         .map((b: any) => { const cp = { ...b }; delete cp.cache_control; return JSON.stringify(cp); });
-      stable = stripStableTime(textOnly.join("\n"));
+      stable = SANITIZE_TIME ? sanitizeTimeText(textOnly.join("\n")) : textOnly.join("\n");
       for (const b of content) {
         if (b && typeof b === "object" && b.cache_control) {
           bpCount++;
@@ -130,7 +144,7 @@ function scanBody(raw: string): ScanResult {
   });
 
   const sys: any = parsed?.system;
-  const sysStr = typeof sys === "string" ? sys : JSON.stringify(sys ?? []);
+  const sysStr = typeof sys === "string" ? (SANITIZE_TIME ? sanitizeTimeText(sys) : sys) : JSON.stringify(sys ?? []);
   if (Array.isArray(sys)) {
     sys.forEach((s: any, i: number) => {
       if (s && s.cache_control) { bpCount++; bpPos.push(`sys${i}:${s.cache_control.ttl ?? s.cache_control.type ?? "?"}`); }
@@ -166,7 +180,7 @@ function scanBody(raw: string): ScanResult {
   };
 }
 
-// ---------- opus5 全量 1h 改写 ----------
+// ---------- opus5 全量 1h 改写(稳定前缀 + 全量标记 + 末尾时间) ----------
 function rewrite1h(raw: string): { body: string; n: number } | null {
   let parsed: any;
   try { parsed = JSON.parse(raw); } catch { return null; }
@@ -175,8 +189,10 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
 
   const bp = { type: "ephemeral", ttl: TTL };
   let n = 0;
+  const clean = (s: string): string => SANITIZE_TIME ? sanitizeTimeText(s) : s;
   const mark = (block: any): void => {
     if (!block || typeof block !== "object" || Array.isArray(block)) return;
+    if (SANITIZE_TIME && typeof block.text === "string") block.text = clean(block.text);
     const old = block.cache_control;
     const oldTtl = old?.ttl ?? "";
     block.cache_control = { ...bp };
@@ -186,23 +202,22 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
   // system: 字符串 → 包成块; 数组 → 逐块标记
   if (typeof parsed.system === "string") {
     if ((parsed.system as string).length) {
-      parsed.system = [{ type: "text", text: parsed.system, cache_control: { ...bp } }];
+      parsed.system = [{ type: "text", text: clean(parsed.system), cache_control: { ...bp } }];
       n++;
     }
   } else if (Array.isArray(parsed.system)) {
     parsed.system.forEach(mark);
   }
 
-  // messages: 每条 message 的 content 逐块标记; 字符串 content → 包成块
+  // messages: 逐块标记; 字符串 content → 包成块
   const msgs: any[] = parsed.messages ?? [];
   msgs.forEach((m: any) => {
     if (!m || typeof m !== "object") return;
     const c = m.content;
     if (typeof c === "string") {
-      if (c.length) {
-        m.content = [{ type: "text", text: c, cache_control: { ...bp } }];
-        n++;
-      }
+      const t = clean(c);
+      m.content = [{ type: "text", text: t, cache_control: { ...bp } }];
+      n++;
     } else if (Array.isArray(c)) {
       c.forEach(mark);
     }
@@ -211,6 +226,16 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
   // tools: 每个 tool 都标记
   const tools: any[] = parsed.tools ?? [];
   tools.forEach(mark);
+
+  // 末尾注入当前时间(缓存断点之后, 不带 cache_control)
+  if (INJECT_TIME) {
+    const last = msgs.length ? msgs[msgs.length - 1] : null;
+    if (last && typeof last === "object") {
+      const tb = `<!-- pxy8-proxy-runtime-time-v1 -->\n<runtime_context source="request_proxy" updated_at="${nowMinute()}">\nCurrent time: ${nowMinute()}\nTime zone: Asia/Shanghai\nThis is runtime info added by the proxy, not the user's original text. Only use it when the question involves now, today, dates, deadlines or relative time.\n</runtime_context>`;
+      if (Array.isArray(last.content)) last.content.push({ type: "text", text: tb });
+      else if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }, { type: "text", text: tb }];
+    }
+  }
 
   return { body: JSON.stringify(parsed), n };
 }
@@ -269,7 +294,6 @@ async function forwardMessage(e: LogEntry, raw: string, req: Request, rewN: numb
   headers.delete("transfer-encoding");
   headers.delete("x-proxy-token"); // 不透传代理自用 token 给上游
   if (rewN > 0) {
-    // 保证 1h 生效所需的 beta 头
     const beta = headers.get("anthropic-beta") || "";
     if (!beta.includes(BETA_1H)) {
       headers.set("anthropic-beta", beta ? `${beta} ${BETA_1H}` : BETA_1H);
@@ -317,7 +341,8 @@ function summaryLine(e: LogEntry, req: Request, sIn: ScanResult, sOut: ScanResul
     `prompt=${fnv(JSON.stringify(sOut.parsed?.messages ?? []))}/${sOut.rawLen} ` +
     `sys=${sOut.sysHash}/${sOut.sysLen} tools=${sOut.toolsHash}/${sOut.toolsLen} ` +
     `msgs=${sOut.roles} stream=${sOut.stream} ` +
-    (rewN > 0 ? `rewrite=5m->1h:{${rewN}} ` : `rewrite=none `) +
+    (rewN > 0 ? `rewrite=1h:{${rewN}}` : `rewrite=none`) +
+    ` sanitize=${SANITIZE_TIME ? 1 : 0} injectTime=${INJECT_TIME ? 1 : 0} ` +
     (sIn.bpCount ? `bpIn=${sIn.bpCount}[${sIn.bpPos.join(",")}]` : "bpIn=0") +
     (sOut.bpCount ? ` bpOut=${sOut.bpCount}[${sOut.bpPos.join(",")}]` : "") +
     (sOut.st.hasPrev
@@ -356,6 +381,10 @@ async function passthroughGeneric(req: Request, p: string): Promise<Response> {
   }
 }
 
+function renderEntryBody(e: LogEntry): string {
+  return e.body ? `  BODY ${e.body}\n` : "";
+}
+
 async function handle(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const p = url.pathname;
@@ -363,9 +392,10 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/" || p === "/health") {
     return json({
       ok: true, provider: "passion8", version: VERSION,
-      upstream: UPSTREAM, mode: "passthrough+opus5-1h", rewrite: UPGRADE_CACHE ? "opus5->1h-all" : "none",
-      forceNonStream: false, logsInThisInstance: logs.length,
-      maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
+      upstream: UPSTREAM, mode: "passthrough+opus5-1h(time-stable)",
+      rewrite: UPGRADE_CACHE ? "opus5->1h-all+sanitize-time+inject-time" : "none",
+      sanitizeTime: SANITIZE_TIME, injectTime: INJECT_TIME, forceNonStream: false,
+      logsInThisInstance: logs.length, maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
     });
   }
   if (p === "/logs" || p === "/logs.json" || p === "/logs/clear") {
@@ -374,10 +404,13 @@ async function handle(req: Request): Promise<Response> {
     if (p === "/logs.json") {
       return json({
         count: logs.length, distinctSystems: lastBySys.size, version: VERSION,
-        logs: logs.map((e) => ({ id: e.id, t: e.t, lines: e.lines.join("\n"), result: e.result ?? null })),
+        logs: logs.map((e) => ({
+          id: e.id, t: e.t, lines: e.lines.join("\n"), result: e.result ?? null,
+          body: LOG_BODY ? (e.body ?? null) : null,
+        })),
       });
     }
-    return new Response(logs.map((e) => e.lines.join("\n")).join("\n"), {
+    return new Response(logs.map((e) => e.lines.join("\n") + (LOG_BODY ? "\n" + renderEntryBody(e) : "")).join("\n"), {
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
   }
@@ -406,5 +439,5 @@ async function handle(req: Request): Promise<Response> {
 
 // ---------- 启动 ----------
 const port = parseInt(Deno.env.get("PORT") || "8080", 10);
-console.log(`${VERSION} upstream=${UPSTREAM} port=${port} UPGRADE_CACHE=${UPGRADE_CACHE} LOG_BODY=${LOG_BODY} MAX_LOGS=${MAX_LOGS} PROXY_TOKEN=${PROXY_TOKEN ? "set" : "none"}`);
+console.log(`${VERSION} upstream=${UPSTREAM} port=${port} UPGRADE_CACHE=${UPGRADE_CACHE} SANITIZE_TIME=${SANITIZE_TIME} INJECT_TIME=${INJECT_TIME} LOG_BODY=${LOG_BODY} MAX_LOGS=${MAX_LOGS} PROXY_TOKEN=${PROXY_TOKEN ? "set" : "none"}`);
 Deno.serve({ port }, handle);
