@@ -1,11 +1,17 @@
 /**
- * passion8 relay - Claude 1h full-prefix cache + current-time injection + response diagnostics
+ * passion8 relay - Claude 5m full-prefix cache + current-time injection + response diagnostics
  * Single-file version for Zeabur (v3.1: reverse-proxy-safe HTTPS detection)
  * Upstream: https://passion8.cc
  *
  * LobeHub Anthropic Base URL:
  * https://YOUR_PROJECT.zeabur.app
  * Do not use http:// and do not append /v1/messages to the Base URL.
+ *
+ * v3.5 changes:
+ * - TTL switched from "1h" to "5m" (default cache TTL; 1h was rarely honored by
+ *   middlemen). extended-cache-ttl beta now appended only when TTL="1h".
+ * - BREAKPOINT_MODE default changed to "all": keep same-TTL breakpoints and top
+ *   up to 4, preserving LobeHub layout for best (shared) cache hits.
  *
  * v3.1 fix:
  * - Trusts x-forwarded-proto when present, avoiding an HTTPS redirect loop behind Zeabur.
@@ -34,7 +40,7 @@
  * UPSTREAM_URL        default https://passion8.cc
  * PROXY_TOKEN         optional access token; requests must carry x-proxy-token
  * CACHE_TTL_ON        "0" = do not touch cache; default on
- * BREAKPOINT_MODE     "message" (default, single message breakpoint) | "all" (max 4)
+ * BREAKPOINT_MODE     "all" (default, keep+topup, max 4) | "message" (single tail breakpoint)
  * TAIL_BREAKPOINTS    number of tail message breakpoints; default 2, suggest 1~2
  * INJECT_CURRENT_TIME "0" = do not inject current time; default on
  * TIME_ZONE           default Asia/Shanghai
@@ -45,9 +51,9 @@
  */
 
 const PROVIDER = "passion8";
-const VERSION = "v3.4.4-errraw";
+const VERSION = "v3.5-5m";
 const DEFAULT_UPSTREAM = "https://passion8.cc";
-const TTL = "1h";
+const TTL: string = "5m";
 const BETA_FLAG = "extended-cache-ttl-2025-04-11";
 const MAX_BREAKPOINTS = 4;
 const MIN_CHARS = 2000;
@@ -59,7 +65,7 @@ type Any = any;
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || DEFAULT_UPSTREAM).replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const CACHE_ENABLED = Deno.env.get("CACHE_TTL_ON") !== "0";
-const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "message").toLowerCase();
+const BREAKPOINT_MODE = (Deno.env.get("BREAKPOINT_MODE") || "all").toLowerCase();
 const TIME_ENABLED = Deno.env.get("INJECT_CURRENT_TIME") !== "0";
 const TIME_ZONE = Deno.env.get("TIME_ZONE") || "Asia/Shanghai";
 const DEBUG = Deno.env.get("DEBUG") === "1";
@@ -1114,7 +1120,8 @@ async function handler(req: Request): Promise<Response> {
 
     // As long as caching is enabled, always add beta on the Anthropic native path.
     // Do not add it only when the body changed, or requests already at 1h would miss it.
-    if (isMessagesPath(path)) {
+    // extended-cache-ttl beta 仅 1h 断点需要; 5m 是默认缓存能力, 不追加。
+    if (TTL === "1h" && isMessagesPath(path)) {
       headers.set("anthropic-beta", mergeBetaHeader(headers.get("anthropic-beta")));
     }
   }
