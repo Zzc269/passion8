@@ -1,11 +1,12 @@
 // ============================================================
-//  xyc-proxy v8.8-opus5-1h-canon — passion 专用
+//  xyc-proxy v8.9-opus5-1h-4bp — passion 专用
 //  ------------------------------------------------------------
-//  在 v8.7 基础上新增: 文本块键序规范化(canonicalize)
-//    -> 固定 {type,text,...,cache_control} 顺序, 消除 LobeHub
-//       最新消息vs历史消息键序不一致导致的上游字节级缓存miss
-//  其余行为同 v8.7: sanitize 时间块 + 剔除 topic_reference +
-//   全块 1h + 末尾注入时间
+//  在 v8.8 基础上: 全量标记改为点位式 4 断点(全 1h)
+//    - tools末尾 / system末尾 / messages稳定前缀末尾 / 最后user前
+//    全量44断点远超Anthropic官方上限4, 网关截断导致messages段
+//    从未建缓存(read恒定=仅system+tools); 回归4点=整条前缀皆可命中
+//  保留 v8.8: 键序规范化 + sanitize时间块 + 剔除 topic_reference +
+//   末尾注入时间(在最后断点之后, 不占缓存前缀)
 //
 //  环境变量:
 //    UPSTREAM_URL       默认 https://passion8.cc
@@ -19,7 +20,7 @@
 //    RETRY              0|1  默认 0
 // ============================================================
 
-const VERSION = "v8.8-opus5-1h-canon";
+const VERSION = "v8.9-opus5-1h-4bp";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -193,7 +194,7 @@ function scanBody(raw: string): ScanResult {
   };
 }
 
-// ---------- opus5 全量 1h 改写(稳定前缀 + 全量标记 + 末尾时间) ----------
+// ---------- opus5 点位式 4 断点 1h 改写 ----------
 function rewrite1h(raw: string): { body: string; n: number } | null {
   let parsed: any;
   try { parsed = JSON.parse(raw); } catch { return null; }
@@ -201,16 +202,18 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
   if (!OPUS5_RE.test(String(parsed.model ?? ""))) return null;
 
   const bp = { type: "ephemeral", ttl: TTL };
-  let n = 0;
-  const clean = (s: string): string => SANITIZE_TIME ? sanitizeTimeText(s) : s;
-  const mark = (block: any): void => {
-    if (!block || typeof block !== "object" || Array.isArray(block)) return;
-    if (SANITIZE_TIME && typeof block.text === "string") block.text = clean(block.text);
-    const old = block.cache_control;
-    const oldTtl = old?.ttl ?? "";
-    block.cache_control = { ...bp };
-    if (oldTtl !== TTL) n++;
-    // 键序规范化: type -> text -> 其余原字段(去cache_control) -> cache_control
+  const cleanBlock = (block: any): any => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return block;
+    if (SANITIZE_TIME && typeof block.text === "string") block.text = sanitizeSystemText(sanitizeTimeText(block.text));
+    return block;
+  };
+  const stripCC = (block: any): any => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return block;
+    delete block.cache_control;
+    return block;
+  };
+  const canonify = (block: any): any => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return block;
     const cc = block.cache_control;
     const out: any = {};
     if (block.type !== undefined) out.type = block.type;
@@ -219,54 +222,97 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
       if (k === "type" || k === "text" || k === "cache_control") continue;
       out[k] = block[k];
     }
-    out.cache_control = cc;
-    for (const k of Object.keys(block)) delete block[k];
-    Object.assign(block, out);
+    if (cc) out.cache_control = cc;
+    return out;
   };
 
-  // system: 字符串 → 包成块; 数组 → 逐块标记(文本先过 topic 剔除)
-  const cleanSysBlock = (block: any): void => {
-    if (SANITIZE_TIME && block && typeof block === "object" && typeof block.text === "string") {
-      block.text = sanitizeSystemText(sanitizeTimeText(block.text));
-    }
-    mark(block);
-  };
+  // system: 字符串->块; 数组->清理文本/键序/旧断点
   if (typeof parsed.system === "string") {
     if ((parsed.system as string).length) {
-      parsed.system = [{
-        type: "text",
-        text: clean(parsed.system),
-        cache_control: { ...bp },
-      }];
-      n++;
+      parsed.system = [{ type: "text", text: sanitizeSystemText(sanitizeTimeText(parsed.system)) }];
     }
   } else if (Array.isArray(parsed.system)) {
-    parsed.system.forEach(cleanSysBlock);
+    parsed.system = parsed.system.map(cleanBlock).map(stripCC).map(canonify);
   }
 
-  // messages: 逐块标记; 字符串 content → 包成块
+  // messages: 全部清理文本/键序/旧断点
   const msgs: any[] = parsed.messages ?? [];
   msgs.forEach((m: any) => {
     if (!m || typeof m !== "object") return;
     const c = m.content;
     if (typeof c === "string") {
-      const t = clean(c);
-      m.content = [{ type: "text", text: t, cache_control: { ...bp } }];
-      n++;
+      m.content = [{ type: "text", text: sanitizeSystemText(sanitizeTimeText(c)) }];
     } else if (Array.isArray(c)) {
-      c.forEach(mark);
+      m.content = c
+        .filter((b: any) => b && typeof b === "object")
+        .map(cleanBlock)
+        .map(stripCC)
+        .map(canonify);
     }
   });
 
-  // tools: 每个 tool 都标记
-  const tools: any[] = parsed.tools ?? [];
-  tools.forEach(mark);
+  // tools: 清理键序/旧断点
+  if (Array.isArray(parsed.tools)) {
+    parsed.tools = parsed.tools.map(stripCC).map(canonify);
+  }
 
-  // 末尾注入当前时间(缓存断点之后, 不带 cache_control)
+  // ===== 点位式 4 个 1h 断点 =====
+  let n = 0;
+  const put = (obj: any): void => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return;
+    if (!obj.cache_control || obj.cache_control.ttl !== TTL) {
+      obj.cache_control = { ...bp };
+      n++;
+    }
+  };
+
+  // 1) tools 最后一项
+  const toolsArr: any[] = parsed.tools ?? [];
+  if (toolsArr.length) put(toolsArr[toolsArr.length - 1]);
+
+  // 2) system 最后一块(字符串时包成块)
+  if (Array.isArray(parsed.system) && parsed.system.length) {
+    put(parsed.system[parsed.system.length - 1]);
+  } else if (typeof parsed.system === "string" && (parsed.system as string).length) {
+    parsed.system = [{ type: "text", text: parsed.system, cache_control: { ...bp } }];
+    n++;
+  }
+
+  // 3) messages 稳定前缀末尾 = 倒数第二条消息的最后一个块
+  if (msgs.length >= 2) {
+    const prevMsg = msgs[msgs.length - 2];
+    const pc = prevMsg?.content;
+    if (Array.isArray(pc) && pc.length) {
+      put(pc[pc.length - 1]);
+    } else if (typeof pc === "string" && pc.length) {
+      prevMsg.content = [{ type: "text", text: pc, cache_control: { ...bp } }];
+      n++;
+    }
+  }
+
+  // 4) 最后一条 user 正文块打点(保证最新问题也被缓存前缀包含)
+  if (msgs.length) {
+    const lastMsg = msgs[msgs.length - 1];
+    const lc = lastMsg?.content;
+    if (Array.isArray(lc) && lc.length) {
+      const textBlocks = lc.filter((b: any) => b && typeof b === "object" && b.type === "text");
+      if (textBlocks.length) put(textBlocks[textBlocks.length - 1]);
+    } else if (typeof lc === "string" && lc.length) {
+      lastMsg.content = [{ type: "text", text: lc, cache_control: { ...bp } }];
+      n++;
+    }
+  }
+
+  // 末尾注入当前时间(在最后断点之后, 不带 cache_control)
   if (INJECT_TIME) {
     const last = msgs.length ? msgs[msgs.length - 1] : null;
     if (last && typeof last === "object") {
-      const tb = `<!-- pxy8-proxy-runtime-time-v1 -->\n<runtime_context source="request_proxy" updated_at="${nowMinute()}">\nCurrent time: ${nowMinute()}\nTime zone: Asia/Shanghai\nThis is runtime info added by the proxy, not the user's original text. Only use it when the question involves now, today, dates, deadlines or relative time.\n</runtime_context>`;
+      const tb = `<!-- pxy8-proxy-runtime-time-v1 -->
+<runtime_context source="request_proxy" updated_at="${nowMinute()}">
+Current time: ${nowMinute()}
+Time zone: Asia/Shanghai
+This is runtime info added by the proxy, not the user's original text. Only use it when the question involves now, today, dates, deadlines or relative time.
+</runtime_context>`;
       if (Array.isArray(last.content)) last.content.push({ type: "text", text: tb });
       else if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }, { type: "text", text: tb }];
     }
@@ -427,8 +473,8 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/" || p === "/health") {
     return json({
       ok: true, provider: "passion8", version: VERSION,
-      upstream: UPSTREAM, mode: "passthrough+opus5-1h(canon)",
-      rewrite: UPGRADE_CACHE ? "opus5->1h-all+sanitize-time+inject-time+sys-stable+canon" : "none",
+      upstream: UPSTREAM, mode: "passthrough+opus5-1h(4bp)",
+      rewrite: UPGRADE_CACHE ? "opus5->4x1h-points+sanitize+canon+sys-stable+inject-time" : "none",
       sanitizeTime: SANITIZE_TIME, injectTime: INJECT_TIME, forceNonStream: false,
       logsInThisInstance: logs.length, maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
     });
