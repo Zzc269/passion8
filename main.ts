@@ -1,10 +1,11 @@
 // ============================================================
-//  xyc-proxy v8.7-opus5-1h-sys — passion 专用
+//  xyc-proxy v8.8-opus5-1h-canon — passion 专用
 //  ------------------------------------------------------------
-//  在 v8.6 基础上新增: opus5 出站时剔除 system 中的动态
-//    <topic_reference_context>...</topic_reference_context> 与包装注释
-//    (保留静态 context.instruction), 消除话题摘要漂移导致的前缀不稳
-//  其余行为同 v8.6: sanitize 动态时间块 + 全块 1h + 末尾注入时间
+//  在 v8.7 基础上新增: 文本块键序规范化(canonicalize)
+//    -> 固定 {type,text,...,cache_control} 顺序, 消除 LobeHub
+//       最新消息vs历史消息键序不一致导致的上游字节级缓存miss
+//  其余行为同 v8.7: sanitize 时间块 + 剔除 topic_reference +
+//   全块 1h + 末尾注入时间
 //
 //  环境变量:
 //    UPSTREAM_URL       默认 https://passion8.cc
@@ -18,7 +19,7 @@
 //    RETRY              0|1  默认 0
 // ============================================================
 
-const VERSION = "v8.7-opus5-1h-sys";
+const VERSION = "v8.8-opus5-1h-canon";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -209,6 +210,18 @@ function rewrite1h(raw: string): { body: string; n: number } | null {
     const oldTtl = old?.ttl ?? "";
     block.cache_control = { ...bp };
     if (oldTtl !== TTL) n++;
+    // 键序规范化: type -> text -> 其余原字段(去cache_control) -> cache_control
+    const cc = block.cache_control;
+    const out: any = {};
+    if (block.type !== undefined) out.type = block.type;
+    if (block.text !== undefined) out.text = block.text;
+    for (const k of Object.keys(block)) {
+      if (k === "type" || k === "text" || k === "cache_control") continue;
+      out[k] = block[k];
+    }
+    out.cache_control = cc;
+    for (const k of Object.keys(block)) delete block[k];
+    Object.assign(block, out);
   };
 
   // system: 字符串 → 包成块; 数组 → 逐块标记(文本先过 topic 剔除)
@@ -414,8 +427,8 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/" || p === "/health") {
     return json({
       ok: true, provider: "passion8", version: VERSION,
-      upstream: UPSTREAM, mode: "passthrough+opus5-1h(sys-stable)",
-      rewrite: UPGRADE_CACHE ? "opus5->1h-all+sanitize-time+inject-time+sys-stable" : "none",
+      upstream: UPSTREAM, mode: "passthrough+opus5-1h(canon)",
+      rewrite: UPGRADE_CACHE ? "opus5->1h-all+sanitize-time+inject-time+sys-stable+canon" : "none",
       sanitizeTime: SANITIZE_TIME, injectTime: INJECT_TIME, forceNonStream: false,
       logsInThisInstance: logs.length, maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
     });
