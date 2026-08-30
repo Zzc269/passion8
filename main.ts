@@ -1,18 +1,17 @@
 // ============================================================
-//  xyc-proxy v8.9-opus5-1h-4bp — passion 专用
+//  xyc-proxy v8.10-opus5-1h-4bp — passion 专用
 //  ------------------------------------------------------------
-//  在 v8.8 基础上: 全量标记改为点位式 4 断点(全 1h)
-//    - tools末尾 / system末尾 / messages稳定前缀末尾 / 最后user前
-//    全量44断点远超Anthropic官方上限4, 网关截断导致messages段
-//    从未建缓存(read恒定=仅system+tools); 回归4点=整条前缀皆可命中
-//  保留 v8.8: 键序规范化 + sanitize时间块 + 剔除 topic_reference +
-//   末尾注入时间(在最后断点之后, 不占缓存前缀)
+//  在 v8.9 基础上: INJECT_TIME 默认关闭(仅显式 =1 才注入时间)
+//    时间感知改由 MCP 时间工具(get_current_time)提供 -> 时间只出现在
+//    tool_result, 历史固定字节, 缓存前缀零污染; 也彻底消除"断点
+//    tool30 框住时间块"导致的 read=0
+//  保留: 4点位式 1h 断点 + 键序规范化 + sanitize + 剔除 topic_reference
 //
 //  环境变量:
 //    UPSTREAM_URL       默认 https://passion8.cc
 //    UPGRADE_CACHE      1|0  默认 1
 //    SANITIZE_TIME      1|0  默认 1(剔除动态时间块)
-//    INJECT_TIME        1|0  默认 1(末尾注入当前时间)
+//    INJECT_TIME        1|0  默认 0(默认关; 时间用MCP工具, 设1才代理注入)
 //    PROXY_TOKEN        /logs* 保护
 //    LOG_BODY           1|0  默认 1
 //    MAX_LOGS           默认 250
@@ -20,7 +19,7 @@
 //    RETRY              0|1  默认 0
 // ============================================================
 
-const VERSION = "v8.9-opus5-1h-4bp";
+const VERSION = "v8.10-opus5-1h-4bp";
 const UPSTREAM = (Deno.env.get("UPSTREAM_URL") || "https://passion8.cc").replace(/\/+$/, "");
 const PROXY_TOKEN = Deno.env.get("PROXY_TOKEN") || "";
 const LOG_BODY = Deno.env.get("LOG_BODY") !== "0";
@@ -29,7 +28,7 @@ const PASSTHROUGH_OTHER = Deno.env.get("PASSTHROUGH_OTHER") !== "0";
 const RETRY = Deno.env.get("RETRY") === "1";
 const UPGRADE_CACHE = Deno.env.get("UPGRADE_CACHE") !== "0";
 const SANITIZE_TIME = Deno.env.get("SANITIZE_TIME") !== "0";
-const INJECT_TIME = Deno.env.get("INJECT_TIME") !== "0";
+const INJECT_TIME = Deno.env.get("INJECT_TIME") === "1";
 const BODY_CAP = 50000;
 const TTL = "1h";
 const BETA_1H = "extended-cache-ttl-2025-04-11";
@@ -473,8 +472,8 @@ async function handle(req: Request): Promise<Response> {
   if (p === "/" || p === "/health") {
     return json({
       ok: true, provider: "passion8", version: VERSION,
-      upstream: UPSTREAM, mode: "passthrough+opus5-1h(4bp)",
-      rewrite: UPGRADE_CACHE ? "opus5->4x1h-points+sanitize+canon+sys-stable+inject-time" : "none",
+      upstream: UPSTREAM, mode: "passthrough+opus5-1h(4bp,noTime)",
+      rewrite: UPGRADE_CACHE ? "opus5->4x1h-points+sanitize+canon+sys-stable(injectTime only if INJECT_TIME=1)" : "none",
       sanitizeTime: SANITIZE_TIME, injectTime: INJECT_TIME, forceNonStream: false,
       logsInThisInstance: logs.length, maxLogs: MAX_LOGS, distinctSystems: lastBySys.size,
     });
